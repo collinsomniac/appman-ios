@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, exe: appman.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, exe: appman }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: appman }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.exe }} dist/
+          cd dist && 7z a ../appman-${{ matrix.target }}.zip ${{ matrix.exe }} 2>/dev/null || zip ../appman-${{ matrix.target }}.zip ${{ matrix.exe }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appman-${{ matrix.target }}
+          path: appman-${{ matrix.target }}.zip
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" appman-*.zip --repo "${{ github.repository }}" --generate-notes

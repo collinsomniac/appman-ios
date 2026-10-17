@@ -1,0 +1,41 @@
+[package]
+name = "appman"
+version = "0.1.0"
+edition = "2024"
+description = "Sign and install iOS apps on your own iPhone with a free Apple ID, over Tailscale, from one binary"
+license = "MIT"
+repository = "https://github.com/collinsomniac/appman-ios"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+der = "0.7"
+dirs = "6"
+gethostname = "1"
+hex = "0.4"
+idevice = { version = "0.1.68", default-features = false, features = [
+    "ring", "remote_pairing", "rsd", "tunnel_tcp_stack", "installation_proxy", "afc", "crashreportcopymobile",
+    "usbmuxd", "core_device_proxy", "xpc",
+] }
+isideload = { version = "0.4.6", default-features = false, features = ["install", "keyring-storage", "fs-storage", "tokio-mt"] }
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+plist = "1.8"
+rootcause = "0.12"
+rpassword = "7"
+rsa = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v3"] }
+walkdir = "2"
+x509-cert = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true
+lto = "thin"
