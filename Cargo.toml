@@ -39,3 +39,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [profile.release]
 strip = true
 lto = "thin"
+
+# isideload with one fix: fresh anisette data for every Apple request (see vendor/isideload/APPMAN-PATCH.md).
+[patch.crates-io]
+isideload = { path = "vendor/isideload" }
