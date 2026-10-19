@@ -37,19 +37,50 @@ Download `appman` from [Releases](../../releases) or `cargo install --git https:
 | `appman crash <executable>` | Saves the app's crash reports and prints the newest one's exception and backtrace. |
 | `appman slot <name> <bundle-id>` | Names an app ID slot for `--as`. |
 | `appman status` | Configuration, pairing, cached profiles and their expiry, sign-in guard. |
+| `appman doctor` | Checks everything a deploy needs (keychain, saved session, anisette, the phone's reachability, profiles) without signing in, and says what to fix. |
+| `appman refresh [--days N] [--all]` | Re-signs and reinstalls every library app whose profile expires within N days (default 2), with one Apple session for all. |
+| `appman logout` | Forgets the saved Apple session. |
 
 ## How signing works (and why it rarely needs your password)
 
-* The **first** signing of an app ID signs in to Apple, registers the app ID, and caches the
-  provisioning profile Apple returns (free profiles last 7 days).
+* The **first** signing of an app ID needs Apple: it registers the app ID and caches the provisioning
+  profile Apple returns (free profiles last 7 days).
+* **Apple sessions are reused.** The first time appman needs Apple it signs in (password from the keychain,
+  and a 2FA code if Apple asks), then keeps the session Apple issued in the OS keychain. Later online
+  signings resume it, using the cached Xcode token while it lasts, then a new one derived from the session:
+  no password, no 2FA, one request. Only if Apple refuses the session does appman sign in again.
+  The anisette machine identity is kept per server too, so Apple keeps seeing the same "device".
+* **Library and refresh.** Each `deploy` keeps the unsigned IPA. `appman refresh` re-signs and
+  reinstalls whatever is close to expiry, resuming one session for all of it. That's the weekly routine.
 * Every later signing of that app ID is **offline**: the cached profile plus the certificate key in your
   keychain. No sign-in, no 2FA, no network. `appman status` shows how long each profile has left.
 * **Sign-in guard.** Apple locks accounts that see repeated failed or unusual sign-ins. After a failed
   sign-in appman waits an hour before allowing another, stops after 3 failures in 24 hours, and refuses
   entirely once Apple reports the account locked. Use `--force-signin` to override it, for example
   after unlocking the account at iforgot.apple.com.
-* **2FA.** Type the code when asked, or set `APPMAN_2FA_FILE=<path>` and write the code to that file.
-  That lets an agent, or you from another device, supply it.
+* **2FA.** Apple pushes a code to your trusted devices: tap Allow there and type the code when appman
+  asks. Or set `APPMAN_2FA_FILE=<path>` and write the code to that file, so an agent, or you from another
+  device, can supply it.
+* **Certificates are never revoked silently.** appman reuses the development certificate whose key is in
+  your keychain. If both of the account's certificates belong to other tools or PCs, it stops and says so;
+  `--revoke-cert` replaces one, and every app that certificate signed stops launching.
+
+## More than one app
+
+Each app on the phone needs its own app ID (its bundle ID with your team suffix). A free Apple ID allows:
+
+* **3 apps with live free profiles installed at once** (iOS enforces this on the device),
+* **10 new app IDs per rolling 7 days** (app IDs you already have don't count again),
+* **2 development certificates**, shared by every app and every tool that signs for the account.
+
+So to add an app, give it its own slot and deploy it once; appman registers the ID. From then on, refreshing
+reuses that ID and doesn't spend the weekly quota. To swap apps within the 3-app limit, reuse a slot
+with `--as`.
+
+```
+appman slot cogitator io.example.cogitator
+appman deploy Cogitator.ipa --as cogitator
+```
 
 ## App ID slots (`--as`)
 

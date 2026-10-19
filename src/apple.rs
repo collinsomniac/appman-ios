@@ -2,8 +2,13 @@
 //!
 //! Signing prefers the offline path: every online signing caches the provisioning profile it used, and
 //! while that profile is valid (7 days) the same app ID can be re-signed with the cached certificate key,
-//! with no Apple sign-in at all. Sign-ins go through a guard because Apple locks accounts that see
-//! repeated failed or unusual logins.
+//! with no Apple contact at all.
+//!
+//! When Apple is needed, appman resumes the last session before it ever sends a password: the session
+//! Apple issued at the last sign-in (its identity token and session key) and the short-lived Xcode token
+//! derived from it are kept in the OS keychain. Only when Apple rejects both does a full sign-in (password,
+//! and a 2FA code if Apple asks) happen, through a guard, because Apple locks accounts that see repeated
+//! failed or unusual logins.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,6 +112,10 @@ pub fn store_password(cfg: &Config, password: &str) -> Result<()> {
         .context("saving the password in the OS keychain")
 }
 
+pub fn has_password(cfg: &Config) -> bool {
+    password(cfg).is_ok()
+}
+
 fn password(cfg: &Config) -> Result<String> {
     keyring::Entry::new(&cfg.keyring_service, &cfg.apple_id()?)?
         .get_password()
@@ -145,11 +154,119 @@ fn two_factor(
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-        eprint!("Enter the verification code from your Apple device: ");
+        eprintln!("Apple sent a 6-digit code to your trusted devices (iPhone, iPad or Mac): tap Allow there,");
+        eprintln!("then type the code here. No device? Wait for the SMS option Apple offers after a while.");
+        eprint!("Verification code: ");
         let mut code = String::new();
         let _ = std::io::stdin().read_line(&mut code);
         Ok(TwoFactorCallbackResponse::SubmitCode(code.trim().to_string()))
     }
+}
+
+/// The anisette server appman uses (the configured one, else isideload's default).
+pub fn anisette_server(cfg: &Config) -> String {
+    cfg.anisette.clone().unwrap_or_else(|| isideload::anisette::remote_v3::DEFAULT_ANISETTE_V3_URL.to_string())
+}
+
+/// The anisette provider, keeping one machine identity per server: an identity minted by one server is
+/// rejected when sent via another. A stable identity is also what lets Apple recognise this "device" and
+/// skip 2FA on later sign-ins.
+fn anisette_provider(cfg: &Config) -> Result<RemoteV3AnisetteProvider> {
+    let server = anisette_server(cfg);
+    let host = server.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').replace(['/', ':'], "_");
+    Ok(RemoteV3AnisetteProvider::default()
+        .map_err(report)?
+        .set_serial_number("0".to_string())
+        .set_url(&server)
+        .set_storage(Box::new(FsStorage::new(config::path("anisette")?.join(host)))))
+}
+
+/// What Apple issued at the last sign-in, kept in the OS keychain so later runs resume instead of signing in.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    /// The session plist (adsid, identity token, session key), as binary plist.
+    spd: Vec<u8>,
+    /// The Xcode token derived from it: (token, expiry in ms since the epoch).
+    xcode: Option<(String, u64, u64)>,
+}
+
+fn session_entry(cfg: &Config) -> Result<keyring::Entry> {
+    let email_hash = hex::encode(Sha256::digest(cfg.apple_id()?.as_bytes()));
+    Ok(keyring::Entry::new(&cfg.keyring_service, &format!("{email_hash}/appman-session"))?)
+}
+
+fn load_session(cfg: &Config) -> Option<SavedSession> {
+    serde_json::from_slice(&session_entry(cfg).ok()?.get_secret().ok()?).ok()
+}
+
+fn save_session(cfg: &Config, session: &SavedSession) {
+    if let (Ok(entry), Ok(bytes)) = (session_entry(cfg), serde_json::to_vec(session)) {
+        let _ = entry.set_secret(&bytes);
+    }
+}
+
+pub fn forget_session(cfg: &Config) {
+    if let Ok(entry) = session_entry(cfg) {
+        let _ = entry.delete_credential();
+    }
+}
+
+/// When the saved session's Xcode token expires (None when there is no saved session).
+pub fn saved_session_status(cfg: &Config) -> Option<Option<SystemTime>> {
+    let saved = load_session(cfg)?;
+    Some(saved.xcode.map(|(_, _, expiry)| ms_to_time(expiry)))
+}
+
+fn ms_to_time(expiry: u64) -> SystemTime {
+    // Apple reports token expiry in milliseconds since the epoch.
+    let secs = if expiry > 10_000_000_000 { expiry / 1000 } else { expiry };
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+fn spd_bytes(spd: &plist::Dictionary) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    plist::to_writer_binary(&mut out, spd).ok()?;
+    Some(out)
+}
+
+/// A developer-services session: from the cached Xcode token, else by resuming the saved session, else by
+/// signing in. Whatever Apple issues is saved for next time.
+pub async fn developer_session(cfg: &Config, force: bool) -> Result<DeveloperSession> {
+    let email = cfg.apple_id()?;
+    if let Some(saved) = load_session(cfg) {
+        let mut account = AppleAccount::builder(&email).anisette_provider(anisette_provider(cfg)?).build().await.map_err(report)?;
+        let spd: Option<plist::Dictionary> = plist::from_bytes(&saved.spd).ok();
+        let adsid = spd.as_ref().and_then(|d| d.get("adsid")).and_then(|v| v.as_string()).map(str::to_string);
+        if let (Some((token, duration, expiry)), Some(adsid)) = (saved.xcode.clone(), adsid.clone())
+            && ms_to_time(expiry) > SystemTime::now() + Duration::from_secs(600)
+        {
+            eprintln!("Using the saved Apple session (no sign-in).");
+            let token = isideload::auth::apple_account::AppToken { token, duration, expiry };
+            return Ok(DeveloperSession::new(token, adsid, account.grandslam_client.clone(), account.anisette_generator.clone()));
+        }
+        account.spd = spd;
+        match account.get_app_token("xcode.auth").await {
+            Ok(token) => {
+                eprintln!("Resumed the saved Apple session (no password, no 2FA).");
+                save_session(cfg, &SavedSession { spd: saved.spd.clone(), xcode: Some((token.token.clone(), token.duration, token.expiry)) });
+                let adsid = adsid.ok_or_else(|| anyhow!("saved session has no adsid"))?;
+                return Ok(DeveloperSession::new(token, adsid, account.grandslam_client.clone(), account.anisette_generator.clone()));
+            }
+            Err(e) => eprintln!("The saved Apple session is no longer accepted ({}); signing in again.", short(&format!("{e:?}"))),
+        }
+    }
+    let mut account = sign_in(cfg, force).await?;
+    let session = DeveloperSession::from_account(&mut account).await.map_err(report)?;
+    if let Some(spd) = account.spd.as_ref().and_then(spd_bytes) {
+        let token = account.get_app_token("xcode.auth").await.ok();
+        save_session(cfg, &SavedSession { spd, xcode: token.map(|t| (t.token, t.duration, t.expiry)) });
+        eprintln!("Saved the Apple session in the keychain; the next runs resume it instead of signing in.");
+    }
+    Ok(session)
+}
+
+fn short(text: &str) -> String {
+    text.lines().next().unwrap_or(text).chars().take(160).collect()
 }
 
 async fn sign_in(cfg: &Config, force: bool) -> Result<AppleAccount> {
@@ -157,16 +274,9 @@ async fn sign_in(cfg: &Config, force: bool) -> Result<AppleAccount> {
     ledger.check(force)?;
     let email = cfg.apple_id()?;
     let password = password(cfg)?;
+    let provider = anisette_provider(cfg)?;
 
-    let mut provider = RemoteV3AnisetteProvider::default().map_err(report)?.set_serial_number("0".to_string());
-    let server = cfg.anisette.clone().unwrap_or_else(|| isideload::anisette::remote_v3::DEFAULT_ANISETTE_V3_URL.to_string());
-    // One anisette identity per server: an identity minted by one server is rejected when sent via another.
-    let host = server.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').replace(['/', ':'], "_");
-    provider = provider
-        .set_url(&server)
-        .set_storage(Box::new(FsStorage::new(config::path("anisette")?.join(host))));
-
-    eprintln!("Signing in to Apple as {email}...");
+    eprintln!("Signing in to Apple as {email} (password from the keychain)...");
     match AppleAccount::builder(&email).anisette_provider(provider).login(&password, two_factor).await {
         Ok(account) => {
             ledger.failures.clear();
@@ -272,13 +382,17 @@ pub fn cache_profile(bytes: &[u8]) -> Result<()> {
 // Signing
 
 /// Sign online: sign in, register the app ID if needed, fetch a profile, sign. Caches the profile.
-pub async fn sign_online(cfg: &Config, app: &Path, out: &Path, udid: &str, force: bool) -> Result<()> {
-    let mut account = sign_in(cfg, force).await?;
-    let session = DeveloperSession::from_account(&mut account).await.map_err(report)?;
+///
+/// The development certificate is reused while its key is in the keychain. A free account holds two; when
+/// both are taken by other machines or tools, appman stops rather than revoke one (revoking breaks every
+/// app that certificate signed) unless `revoke_cert` is set.
+pub async fn sign_online(cfg: &Config, app: &Path, out: &Path, udid: &str, force: bool, revoke_cert: bool) -> Result<()> {
+    let session = developer_session(cfg, force).await?;
+    let behavior = if revoke_cert { MaxCertsBehavior::<RevokeCallback>::Revoke } else { MaxCertsBehavior::<RevokeCallback>::Error };
     let mut sideloader = SideloaderBuilder::new(session, cfg.apple_id()?)
         .machine_name(cfg.machine_name.clone())
         .storage(Box::new(KeyringStorage::new(cfg.keyring_service.clone())))
-        .max_certs_behavior(MaxCertsBehavior::<RevokeCallback>::Revoke)
+        .max_certs_behavior(behavior)
         .build();
     let staged = out.with_extension("unsigned.ipa");
     ipa::pack(app, &staged)?;
@@ -288,7 +402,17 @@ pub async fn sign_online(cfg: &Config, app: &Path, out: &Path, udid: &str, force
     };
     let result = sideloader.sign_app(staged.clone(), None, true, Some(progress), None, Some(udid)).await;
     let _ = std::fs::remove_file(&staged);
-    let (signed, _) = result.map_err(report).context("signing failed")?;
+    let (signed, _) = result.map_err(report).map_err(|e| {
+        let text = format!("{e:#}");
+        if text.to_lowercase().contains("certificate") && (text.contains("maximum") || text.contains("max")) {
+            anyhow!("{text}\n\nBoth development certificates of this Apple ID are in use (other PCs or tools). \
+                     Re-run with --revoke-cert to replace one; apps that certificate signed stop launching.")
+        } else if text.contains("-36607") || text.to_lowercase().contains("maximum number of apps") {
+            anyhow!("{text}\n\nFree Apple IDs may register 10 new app IDs per 7 days. Reuse an existing slot (`appman status`).")
+        } else {
+            e
+        }
+    }).context("signing failed")?;
     eprintln!();
     if let Ok(bytes) = std::fs::read(signed.join("embedded.mobileprovision")) {
         cache_profile(&bytes)?;
