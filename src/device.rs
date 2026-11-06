@@ -199,6 +199,20 @@ impl Session {
         Ok(rows)
     }
 
+    /// Remove an app from the phone.
+    ///
+    /// A free Apple ID may hold only three apps with live profiles at once, so removing one
+    /// is how a slot is freed for whatever comes next — and until now that had to be done by
+    /// hand on the phone, from a tool whose whole job is managing those slots.
+    pub async fn uninstall(&mut self, bundle_id: &str) -> Result<()> {
+        let mut proxy = InstallationProxyClient::connect_rsd(&mut self.adapter, &mut self.rsd).await.map_err(err)?;
+        proxy
+            .uninstall(bundle_id.to_string(), None)
+            .await
+            .map_err(err)
+            .with_context(|| format!("the iPhone refused to remove {bundle_id}"))
+    }
+
     /// Crash reports whose file name contains `filter` (the app's executable name), newest last.
     pub async fn crash_reports(&mut self, filter: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut client = CrashReportCopyMobileClient::connect_rsd(&mut self.adapter, &mut self.rsd).await.map_err(err)?;

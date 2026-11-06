@@ -64,6 +64,11 @@ enum Command {
     Install { ipa: PathBuf },
     /// List the apps you installed on the iPhone.
     Apps,
+    /// Remove an app from the iPhone (frees one of the three free-profile slots).
+    Uninstall {
+        /// Bundle id, or a slot name from `appman slot`.
+        app: String,
+    },
     /// Save the crash reports of an app (matched by its executable name) and print the newest.
     Crash {
         name: String,
@@ -192,6 +197,14 @@ async fn run(command: Command) -> Result<()> {
             for (id, name, version) in session.apps().await? {
                 println!("{id:50} {name:24} {version}");
             }
+        }
+        Command::Uninstall { app } => {
+            // Accept a slot name so the thing you name in `--as <slot>` is the same
+            // thing you name here; a raw bundle id passes through unchanged.
+            let bundle = cfg.resolve_slot(&app);
+            let mut session = Session::open(cfg.device()?).await?;
+            session.uninstall(&bundle).await?;
+            println!("Removed {bundle}.");
         }
         Command::Crash { name, out } => {
             let mut session = Session::open(cfg.device()?).await?;
